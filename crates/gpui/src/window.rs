@@ -5232,6 +5232,35 @@ impl Window {
         });
         let _ = self.dispatch_event(event, cx);
     }
+
+    /// For testing: clear any active tooltips stored in interactive element state.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn clear_tooltips_for_test(&mut self) {
+        fn clear_frame_tooltips(frame: &mut Frame) {
+            for element_state in frame.element_states.values_mut() {
+                let Some(interactive_state) = element_state
+                    .inner
+                    .as_mut()
+                    .downcast_mut::<Option<crate::InteractiveElementState>>()
+                else {
+                    continue;
+                };
+
+                let Some(interactive_state) = interactive_state.as_mut() else {
+                    continue;
+                };
+
+                if let Some(active_tooltip) = interactive_state.active_tooltip.as_ref() {
+                    active_tooltip.borrow_mut().take();
+                }
+            }
+        }
+
+        clear_frame_tooltips(&mut self.rendered_frame);
+        clear_frame_tooltips(&mut self.next_frame);
+        self.tooltip_bounds = None;
+        self.refresh();
+    }
 }
 
 // #[derive(Clone, Copy, Eq, PartialEq, Hash)]

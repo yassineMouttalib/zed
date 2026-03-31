@@ -1232,6 +1232,13 @@ fn run_breakpoint_hover_visual_tests(
         update_baseline,
     )?;
 
+    // Clear any active tooltip state before teardown so the visual test
+    // runner does not keep tooltip entities alive after the window closes.
+    cx.update_window(workspace_window.into(), |_, window, _cx| {
+        window.clear_tooltips_for_test();
+    })?;
+    cx.run_until_parked();
+
     // Clean up: remove worktrees to stop background scanning
     workspace_window
         .update(cx, |workspace, _window, cx| {
