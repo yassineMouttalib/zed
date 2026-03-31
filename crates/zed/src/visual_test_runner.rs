@@ -1238,7 +1238,6 @@ fn run_breakpoint_hover_visual_tests(
         window.clear_tooltips_for_test();
     })?;
     cx.run_until_parked();
-
     // Clean up: remove worktrees to stop background scanning
     workspace_window
         .update(cx, |workspace, _window, cx| {
