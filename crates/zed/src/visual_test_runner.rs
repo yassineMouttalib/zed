@@ -3102,7 +3102,7 @@ fn create_project_with_worktree(
     worktree_dir: &Path,
     app_state: &Arc<AppState>,
     cx: &mut VisualTestAppContext,
-) -> Entity<Project> {
+) -> Result<Entity<Project>> {
     let project = cx.update(|cx| {
         project::Project::local(
             app_state.client.clone(),
@@ -3128,11 +3128,11 @@ fn create_project_with_worktree(
     cx.background_executor.allow_parking();
     cx.foreground_executor
         .block_test(add_task)
-        .expect("Failed to add worktree");
+        .context("Failed to add worktree")?;
     cx.background_executor.forbid_parking();
 
     cx.run_until_parked();
-    project
+    Ok(project)
 }
 
 #[cfg(target_os = "macos")]
@@ -3282,10 +3282,12 @@ fn run_sidebar_duplicate_project_names_visual_tests(
         cx.update_flags(true, vec!["agent-v2".to_string()]);
     });
 
+    let mut has_baseline_update = None;
+
     // --- Test 1: Two projects with duplicate leaf names ---
     {
-        let project1 = create_project_with_worktree(&code_zed, &app_state, cx);
-        let project2 = create_project_with_worktree(&foo_zed, &app_state, cx);
+        let project1 = create_project_with_worktree(&code_zed, &app_state, cx)?;
+        let project2 = create_project_with_worktree(&foo_zed, &app_state, cx)?;
 
         let window = open_sidebar_test_window(vec![project1, project2], &app_state, cx)?;
 
@@ -3297,16 +3299,21 @@ fn run_sidebar_duplicate_project_names_visual_tests(
         );
 
         cleanup_sidebar_test_window(window, cx);
-        result?;
+        match result? {
+            TestResult::Passed => {}
+            TestResult::BaselineUpdated(path) => {
+                has_baseline_update = Some(path);
+            }
+        }
     }
 
     // --- Test 2: Three projects, third has two worktrees ---
     {
-        let project1 = create_project_with_worktree(&code_zed, &app_state, cx);
-        let project2 = create_project_with_worktree(&foo_zed, &app_state, cx);
+        let project1 = create_project_with_worktree(&code_zed, &app_state, cx)?;
+        let project2 = create_project_with_worktree(&foo_zed, &app_state, cx)?;
 
         // Third project has two worktrees: code/zed and bar/zed
-        let project3 = create_project_with_worktree(&code_zed, &app_state, cx);
+        let project3 = create_project_with_worktree(&code_zed, &app_state, cx)?;
         let add_second_worktree = cx.update(|cx| {
             project3.update(cx, |project, cx| {
                 project.find_or_create_worktree(&bar_zed, true, cx)
@@ -3329,10 +3336,19 @@ fn run_sidebar_duplicate_project_names_visual_tests(
         );
 
         cleanup_sidebar_test_window(window, cx);
-        result?;
+        match result? {
+            TestResult::Passed => {}
+            TestResult::BaselineUpdated(path) => {
+                has_baseline_update = Some(path);
+            }
+        }
     }
 
-    Ok(TestResult::Passed)
+    if let Some(path) = has_baseline_update {
+        Ok(TestResult::BaselineUpdated(path))
+    } else {
+        Ok(TestResult::Passed)
+    }
 }
 
 #[cfg(all(target_os = "macos", feature = "visual-tests"))]
