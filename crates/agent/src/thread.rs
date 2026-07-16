@@ -44,8 +44,8 @@ use language_model::{
     LanguageModelId, LanguageModelImage, LanguageModelProviderId, LanguageModelRegistry,
     LanguageModelRequest, LanguageModelRequestMessage, LanguageModelRequestTool,
     LanguageModelToolResult, LanguageModelToolResultContent, LanguageModelToolSchemaFormat,
-    LanguageModelToolUse, LanguageModelToolUseId, MessageContent, Role, SelectedModel, Speed,
-    StopReason, TokenUsage, ZED_CLOUD_PROVIDER_ID,
+    LanguageModelToolUse, LanguageModelToolUseId, LanguageModelToolUseInput, MessageContent, Role,
+    SelectedModel, Speed, StopReason, TokenUsage, ZED_CLOUD_PROVIDER_ID,
 };
 use project::{Project, trusted_worktrees::TrustedWorktrees};
 use prompt_store::ProjectContext;
@@ -2745,11 +2745,17 @@ impl Thread {
                                     tool_use.raw_input.clear();
                                     stats.raw_input_cleared += 1;
                                 }
-                                if !preserved_ids.contains(&tool_use.id)
-                                    && !tool_use.input.is_null()
-                                {
-                                    tool_use.input = serde_json::Value::Object(Default::default());
-                                    stats.tool_input_elided += 1;
+                                if !preserved_ids.contains(&tool_use.id) {
+                                    let is_non_empty = match &tool_use.input {
+                                        LanguageModelToolUseInput::Json(v) => !v.is_null(),
+                                        LanguageModelToolUseInput::Text(t) => !t.is_empty(),
+                                    };
+                                    if is_non_empty {
+                                        tool_use.input = LanguageModelToolUseInput::Json(
+                                            serde_json::Value::Object(Default::default()),
+                                        );
+                                        stats.tool_input_elided += 1;
+                                    }
                                 }
                                 compacted_content.push(AgentMessageContent::ToolUse(tool_use));
                             }
@@ -2804,7 +2810,11 @@ impl Thread {
         let mut searches: BTreeSet<String> = BTreeSet::new();
         let mut commands: BTreeSet<String> = BTreeSet::new();
 
-        let str_field = |value: &serde_json::Value, key: &str| -> Option<String> {
+        let str_field = |input: &LanguageModelToolUseInput, key: &str| -> Option<String> {
+            let value = match input {
+                LanguageModelToolUseInput::Json(v) => v,
+                LanguageModelToolUseInput::Text(_) => return None,
+            };
             value
                 .get(key)
                 .and_then(|v| v.as_str())
