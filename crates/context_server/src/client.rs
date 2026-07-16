@@ -27,7 +27,7 @@ use crate::{
 };
 
 const JSON_RPC_VERSION: &str = "2.0";
-const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 // Standard JSON-RPC error codes
 pub const PARSE_ERROR: i32 = -32700;

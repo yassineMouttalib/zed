@@ -1,11 +1,11 @@
 use crate::{
-    ApplyCodeActionTool, CodeActionStore, ContextServerRegistry, CopyPathTool, CreateDirectoryTool,
-    CreateThreadTool, DbLanguageModel, DbThread, DeletePathTool, DiagnosticsTool, EditFileTool,
-    FetchTool, FindPathTool, FindReferencesTool, GetCodeActionsTool, GoToDefinitionTool, GrepTool,
-    ListAgentsAndModelsTool, ListDirectoryTool, MovePathTool, ProjectSnapshot, ReadFileTool,
-    RenameTool, SandboxedTerminalTool, SpawnAgentTool, SystemPromptTemplate, Template, Templates,
-    TerminalTool, ToolPermissionDecision, WebSearchTool, WriteFileTool,
-    decide_permission_from_settings,
+    ApplyCodeActionTool, CodeActionStore, CompactThreadTool, ContextServerRegistry, CopyPathTool,
+    CreateDirectoryTool, CreateThreadTool, DbLanguageModel, DbThread, DeletePathTool,
+    DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, FindReferencesTool, GetCodeActionsTool,
+    GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool, ListDirectoryTool, MovePathTool,
+    ProjectSnapshot, ReadFileTool, RenameTool, SandboxedTerminalTool, SpawnAgentTool,
+    SystemPromptTemplate, Template, Templates, TerminalTool, ToolPermissionDecision, WebSearchTool,
+    WriteFileTool, decide_permission_from_settings,
 };
 use acp_thread::{ClientUserMessageId, MentionUri};
 use action_log::ActionLog;
@@ -58,7 +58,7 @@ use settings::{
 use std::fmt::Write;
 use std::{cell::RefCell, ops::ControlFlow};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     marker::PhantomData,
     ops::RangeInclusive,
     path::{Path, PathBuf},
@@ -211,6 +211,22 @@ impl CompactionInfo {
             Self::ProviderNative { .. } => Vec::new(),
         }
     }
+}
+
+/// Statistics returned by [`Thread::compact_physical`] describing what was
+/// deleted from the in-memory thread.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct PhysicalCompactionStats {
+    pub thinking_removed: u32,
+    pub raw_input_cleared: u32,
+    pub tool_input_elided: u32,
+    pub reasoning_details_dropped: u32,
+    pub tool_results_trimmed: u32,
+    pub agent_text_blocks: u32,
+    pub agent_messages: u32,
+    pub user_messages: u32,
+    /// Whether a working-context anchor was injected at the front.
+    pub working_context_added: bool,
 }
 
 impl Message {
@@ -2160,6 +2176,11 @@ impl Thread {
         // `Thread::enabled_tools`.
         self.add_tool(CreateThreadTool::new(environment.clone()));
         self.add_tool(ListAgentsAndModelsTool::new(environment));
+
+        // Native physical compaction: mutates the live thread's in-memory
+        // messages so the reduction takes effect immediately (unlike an
+        // external DB edit, which is overwritten by the next flush).
+        self.add_tool(CompactThreadTool::new(cx.weak_entity()));
     }
 
     pub fn add_tool<T: AgentTool>(&mut self, tool: T) {
@@ -2596,6 +2617,269 @@ impl Thread {
         ));
 
         Ok(events_rx)
+    }
+
+    /// Physically shrink the thread by deleting redundant blocks from its
+    /// in-memory messages — NOT a model summary. Because this mutates
+    /// `self.messages` directly and calls `cx.notify()`, the reduction takes
+    /// effect for the *live* context (the next model request reads the smaller
+    /// messages) and is persisted through the normal observe → `save_thread`
+    /// path.
+    ///
+    /// Algorithm (ported from `ai_agent`'s single-compactor design,
+    /// `core/session_compact.py`):
+    ///   1. EXTRACT a deterministic working context (files read/modified, dirs
+    ///      listed, searches, commands) from the *full* history before any
+    ///      removal — so the model keeps the "what have I done" map.
+    ///   2. KEEP the last `keep_last_n_tool_results` tool call/result *pairs*
+    ///      (by tool_use_id) — recent context + in-context tool examples.
+    ///      Elide the input + trim the result of every other tool call.
+    ///   3. When `strip_all_thinking` is true (the default): drop
+    ///      `Thinking`/`RedactedThinking` and `reasoning_details` from EVERY
+    ///      assistant message. When false: only drop them from steps older than
+    ///      `keep_last_n_turns`.
+    ///   4. Always clear `ToolUse.raw_input` (a redundant copy of `input`).
+    ///   5. INJECT the working context as a `Compaction::Summary` anchor at the
+    ///      front so it survives and primes the next request.
+    ///
+    /// Never touched: every user message, all agent-authored text, tool ids +
+    /// names. A "turn" is one assistant step (`Agent` message).
+    pub fn compact_physical(
+        &mut self,
+        keep_last_n_turns: usize,
+        keep_last_n_tool_results: usize,
+        strip_all_thinking: bool,
+        cx: &mut Context<Self>,
+    ) -> PhysicalCompactionStats {
+        // NOTE: do NOT call self.cancel() OR self.flush_pending_message() here.
+        // This runs as a tool *inside* the running turn. Both are harmful:
+        //  - cancel() takes & cancels our own turn (self-cancellation).
+        //  - flush_pending_message() would take the in-flight pending_message
+        //    (which holds THIS tool's ToolUse, result not yet inserted) and
+        //    stamp it with TOOL_CANCELED_MESSAGE — silently cancelling our own
+        //    tool call and corrupting the current turn's message structure.
+        // There is no in-flight completion request to abort during tool
+        // execution (the model already responded), so neither is needed. The
+        // reduction takes effect on the next request, which reads the smaller
+        // `self.messages`; the pending message (current turn) is left intact.
+        let mut stats = PhysicalCompactionStats::default();
+
+        // ── 1. Extract working context BEFORE any removal ──────────────────
+        let working_context = Self::extract_working_context(&self.messages, &mut stats);
+
+        // ── 2. Identify the tool_use_ids whose call/result pairs we keep ────
+        let mut all_tool_ids: Vec<LanguageModelToolUseId> = Vec::new();
+        for message in self.messages.iter() {
+            if let Message::Agent(agent_message) = &**message {
+                for content in agent_message.content.iter() {
+                    if let AgentMessageContent::ToolUse(tool_use) = content {
+                        all_tool_ids.push(tool_use.id.clone());
+                    }
+                }
+            }
+        }
+        let preserved_ids: HashSet<&LanguageModelToolUseId> = if keep_last_n_tool_results > 0 {
+            all_tool_ids
+                .iter()
+                .rev()
+                .take(keep_last_n_tool_results)
+                .collect()
+        } else {
+            HashSet::default()
+        };
+
+        let total_agent = self
+            .messages
+            .iter()
+            .filter(|m| matches!(***m, Message::Agent(_)))
+            .count();
+        // Assistant ordinal >= keep_from keeps its thinking + reasoning_details.
+        let keep_from = total_agent.saturating_sub(keep_last_n_turns);
+
+        let mut agent_ordinal = 0usize;
+        let mut next_messages = Vec::with_capacity(self.messages.len() + 1);
+
+        // ── 5a. Working-context anchor (compact, factual — not an LLM summary) ─
+        if !working_context.is_empty() {
+            next_messages.push(Arc::new(Message::Compaction(CompactionInfo::Summary(
+                working_context.into(),
+            ))));
+        }
+
+        for message in self.messages.iter() {
+            match &**message {
+                Message::User(_) | Message::Resume | Message::Compaction(_) => {
+                    if matches!(&**message, Message::User(_)) {
+                        stats.user_messages += 1;
+                    }
+                    next_messages.push(message.clone());
+                }
+                Message::Agent(agent_message) => {
+                    let ordinal = agent_ordinal;
+                    agent_ordinal += 1;
+                    let recent = ordinal >= keep_from;
+                    stats.agent_messages += 1;
+
+                    let mut agent_message = agent_message.clone();
+
+                    // Clear redundant raw_input everywhere; elide inputs of
+                    // tool calls whose result pair is NOT preserved.
+                    let mut compacted_content = Vec::with_capacity(agent_message.content.len());
+                    for content in agent_message.content.iter() {
+                        match content {
+                            AgentMessageContent::Text(_) => {
+                                stats.agent_text_blocks += 1;
+                                compacted_content.push(content.clone());
+                            }
+                            AgentMessageContent::Thinking { .. }
+                            | AgentMessageContent::RedactedThinking(_) => {
+                                if !strip_all_thinking && recent {
+                                    compacted_content.push(content.clone());
+                                } else {
+                                    stats.thinking_removed += 1;
+                                }
+                            }
+                            AgentMessageContent::ToolUse(tool_use) => {
+                                let mut tool_use = tool_use.clone();
+                                if !tool_use.raw_input.is_empty() {
+                                    tool_use.raw_input.clear();
+                                    stats.raw_input_cleared += 1;
+                                }
+                                if !preserved_ids.contains(&tool_use.id)
+                                    && !tool_use.input.is_null()
+                                {
+                                    tool_use.input = serde_json::Value::Object(Default::default());
+                                    stats.tool_input_elided += 1;
+                                }
+                                compacted_content.push(AgentMessageContent::ToolUse(tool_use));
+                            }
+                        }
+                    }
+                    agent_message.content = compacted_content;
+
+                    // Drop reasoning; trim tool results not in the preserved set.
+                    if (strip_all_thinking || !recent) && agent_message.reasoning_details.is_some()
+                    {
+                        agent_message.reasoning_details = None;
+                        stats.reasoning_details_dropped += 1;
+                    }
+                    if !agent_message.tool_results.is_empty() {
+                        for (id, result) in agent_message.tool_results.iter_mut() {
+                            if preserved_ids.contains(id) {
+                                continue;
+                            }
+                            if !result.content.is_empty() {
+                                result.content = vec![LanguageModelToolResultContent::Text(
+                                    "[elided by compaction]".into(),
+                                )];
+                                stats.tool_results_trimmed += 1;
+                            }
+                            result.output = None;
+                        }
+                    }
+
+                    next_messages.push(Arc::new(Message::Agent(agent_message)));
+                }
+            }
+        }
+
+        self.messages = next_messages;
+        self.updated_at = Utc::now();
+        cx.notify();
+        stats
+    }
+
+    /// Deterministically extract a compact working-context summary from the
+    /// thread (files read/modified, dirs listed, searches, commands). This is a
+    /// factual scan of tool inputs — NOT an LLM summary — so the model keeps a
+    /// map of what it explored even after the bulky tool payloads are elided.
+    /// Mirrors `ai_agent`'s `extract_exploration_summary`.
+    fn extract_working_context(
+        messages: &[Arc<Message>],
+        stats: &mut PhysicalCompactionStats,
+    ) -> String {
+        let mut files_read: BTreeSet<String> = BTreeSet::new();
+        let mut files_modified: BTreeSet<String> = BTreeSet::new();
+        let mut dirs_listed: BTreeSet<String> = BTreeSet::new();
+        let mut searches: BTreeSet<String> = BTreeSet::new();
+        let mut commands: BTreeSet<String> = BTreeSet::new();
+
+        let str_field = |value: &serde_json::Value, key: &str| -> Option<String> {
+            value
+                .get(key)
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+        };
+
+        for message in messages.iter() {
+            let Message::Agent(agent_message) = &**message else {
+                continue;
+            };
+            for content in agent_message.content.iter() {
+                let AgentMessageContent::ToolUse(tool_use) = content else {
+                    continue;
+                };
+                let name = tool_use.name.as_ref();
+                match name {
+                    "read_file" => {
+                        if let Some(p) = str_field(&tool_use.input, "path") {
+                            files_read.insert(p);
+                        }
+                    }
+                    "edit_file" | "write_file" => {
+                        if let Some(p) = str_field(&tool_use.input, "path") {
+                            files_modified.insert(p);
+                        }
+                    }
+                    "list_directory" => {
+                        if let Some(p) = str_field(&tool_use.input, "path") {
+                            dirs_listed.insert(p);
+                        }
+                    }
+                    "find_path" => {
+                        if let Some(g) = str_field(&tool_use.input, "glob") {
+                            dirs_listed.insert(format!("find: {g}"));
+                        }
+                    }
+                    "grep" => {
+                        if let Some(p) = str_field(&tool_use.input, "regex") {
+                            searches.insert(format!("grep: {}", &p[..p.len().min(60)]));
+                        }
+                    }
+                    "terminal" => {
+                        if let Some(c) = str_field(&tool_use.input, "command") {
+                            commands.insert(c.chars().take(80).collect());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let mut sections: Vec<String> = Vec::new();
+        let mut add = |label: &str, set: &BTreeSet<String>| {
+            if !set.is_empty() {
+                sections.push(format!(
+                    "{label}:\n{}",
+                    set.iter()
+                        .map(|s| format!("  - {s}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ));
+            }
+        };
+        add("Files read", &files_read);
+        add("Files modified", &files_modified);
+        add("Directories listed", &dirs_listed);
+        add("Searches", &searches);
+        add("Commands run", &commands);
+        stats.working_context_added = !sections.is_empty();
+        format!(
+            "Working context retained after physical compaction (older tool \
+             payloads elided; all user/agent text preserved):\n\n{}",
+            sections.join("\n\n")
+        )
     }
 
     pub fn push_acp_user_block(

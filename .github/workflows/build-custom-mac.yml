@@ -1,0 +1,165 @@
+# Custom Zed build for macOS (Apple Silicon)
+# Builds the custom/mcp-fix branch on a GitHub-hosted M1 runner,
+# then uploads a ready-to-use .app bundle as an artifact.
+#
+# This is the "build on a powerful remote machine" solution:
+#   - The compilation (the slow part, 10-30 min locally) runs on GitHub's cloud Mac
+#   - You download the finished .app — no local Rust toolchain or build needed
+#
+# Triggers:
+#   - Push to custom/mcp-fix
+#   - Manual dispatch (Actions tab → "Run workflow")
+name: Build Custom Mac
+
+on:
+  push:
+    branches: [custom/mcp-fix]
+  workflow_dispatch:
+  pull_request:
+    branches: [custom/mcp-fix]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Avoid thrift errors and reduce disk pressure
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + git
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-registry-${{ runner.os }}-
+
+      - name: Cache build target (incremental speedup)
+        uses: actions/cache@v4
+        with:
+          path: target
+          # NOTE: v2-cxxpatch suffix busts the stale cache that contained an
+          # unpatched cxx.h build output (cargo reuses cached build-script
+          # outputs, so the source patch alone doesn't propagate).
+          key: cargo-target-${{ runner.os }}-arm64-v2-cxxpatch-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-target-${{ runner.os }}-arm64-v2-cxxpatch-
+
+      - name: Install cmake
+        run: brew install cmake
+
+      - name: Fetch dependencies (so we can patch cxx.h before building)
+        run: cargo fetch
+
+      # webrtc-sys C++ compilation fails on the macOS 14 SDK's libc++ because
+      # cxx's rust/cxx.h has a static_assert for std::ranges::contiguous_range
+      # whose concept check hits a hard error: rust::Slice<T>::iterator lacks
+      # the element_type typedef that std::pointer_traits requires.
+      # Upstream has NOT merged the fix (still broken in cxx 1.0.196), so we
+      # apply the one-line patch confirmed in dtolnay/cxx#1574 here.
+      # Tracked by: https://github.com/dtolnay/cxx/issues/1574
+      - name: Patch cxx.h — add element_type to Slice iterator (cxx#1574)
+        run: |
+          set -euo pipefail
+
+          patch_one() {
+            local f="$1"
+            if [ ! -f "$f" ]; then return; fi
+            if grep -q 'using element_type = T;' "$f" 2>/dev/null; then
+              echo "  already patched: $f"
+            else
+              awk '{print} /using reference = typename std::add_lvalue_reference<T>::type;/ {print "  using element_type = T;"}' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+              echo "  patched: $f"
+            fi
+          }
+
+          echo "== Patching source cxx.h (cargo registry) =="
+          find ~/.cargo/registry/src -path '*/cxx-*/include/cxx.h' | while IFS= read -r f; do patch_one "$f"; done
+
+          echo "== Patching cached build-output cxx.h copies (target/) =="
+          find target -path '*/rust/cxx.h' 2>/dev/null | while IFS= read -r f; do patch_one "$f"; done
+
+          echo "== Forcing cxx + cxx-build rebuild so the patched source propagates =="
+          # Remove cached build-script outputs so cargo re-runs cxx's build.rs,
+          # which copies the patched include/cxx.h into its OUT_DIR.
+          cargo clean -p cxx --release --target-dir target 2>/dev/null || true
+          cargo clean -p cxx-build --release --target-dir target 2>/dev/null || true
+
+          echo "== Verifying patch on source =="
+          CXX_SRC="$(find ~/.cargo/registry/src -path '*/cxx-*/include/cxx.h' | head -1)"
+          grep -n 'element_type' "$CXX_SRC" || echo "WARNING: element_type not found in $CXX_SRC"
+
+      - name: Build (release, runtime_shaders — no Xcode needed)
+        run: cargo build --release -p zed
+
+      - name: Verify binary
+        run: |
+          test -f target/release/zed || { echo "Binary missing"; exit 1; }
+          du -h target/release/zed
+          file target/release/zed
+
+      - name: Create .app bundle from official Zed
+        run: |
+          set -euo pipefail
+
+          BUNDLE="target/release/Zed Custom.app"
+
+          # Download latest stable official Zed for the bundle structure (icons, resources, etc.)
+          echo "Downloading official Zed.app for bundle structure..."
+          TMP_DMG="/tmp/zed-official.dmg"
+          curl -fSL "https://cloud.zed.dev/releases/stable/latest/download?asset=zed&os=macos&arch=aarch64&source=ci" -o "$TMP_DMG"
+
+          # Mount and copy
+          MOUNT_POINT=$(hdiutil attach -nobrowse -readonly "$TMP_DMG" | grep '/Volumes/' | tail -1 | awk '{print $NF}')
+          OFFICIAL_APP=$(find "$MOUNT_POINT" -name "Zed.app" -maxdepth 2 | head -1)
+          test -n "$OFFICIAL_APP" || { echo "Zed.app not found in DMG"; exit 1; }
+
+          rm -rf "$BUNDLE"
+          cp -R "$OFFICIAL_APP" "$BUNDLE"
+          hdiutil detach "$MOUNT_POINT" -quiet || true
+          rm -f "$TMP_DMG"
+
+          # Swap in our custom binary
+          cp "target/release/zed" "$BUNDLE/Contents/MacOS/zed"
+          chmod +x "$BUNDLE/Contents/MacOS/zed"
+
+          # Patch bundle identifier + name so it doesn't conflict with official Zed
+          PLIST="$BUNDLE/Contents/Info.plist"
+          if [ -f "$PLIST" ]; then
+            /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier dev.zed.custom" "$PLIST" 2>/dev/null || true
+            /usr/libexec/PlistBuddy -c "Set :CFBundleName Zed Custom" "$PLIST" 2>/dev/null || true
+            /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName Zed Custom" "$PLIST" 2>/dev/null || true
+          fi
+
+          # Remove code signature (we're not signing) + quarantine attributes
+          codesign --remove-all "$BUNDLE" 2>/dev/null || true
+          xattr -cr "$BUNDLE" 2>/dev/null || true
+
+          echo "Bundle created:"
+          du -sh "$BUNDLE"
+
+      - name: Compress .app bundle
+        run: |
+          cd target/release
+          ditto -c -k --keepParent "Zed Custom.app" "Zed-Custom-macOS-arm64.zip"
+          ls -lh "Zed-Custom-macOS-arm64.zip"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Zed-Custom-macOS-arm64
+          path: target/release/Zed-Custom-macOS-arm64.zip
+          if-no-files-found: error
+          retention-days: 30

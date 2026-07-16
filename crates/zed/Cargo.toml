@@ -12,9 +12,11 @@ default-run = "zed"
 workspace = true
 
 [features]
+default = ["runtime_shaders"]
 tracy = ["ztracing/tracy"]
 # LEAK_BACKTRACE=1 cargo run --features zed/track-project-leak --profile release-fast
 track-project-leak = ["gpui/leak-detection"]
+runtime_shaders = ["gpui_platform/runtime_shaders"]
 test-support = [
     "gpui/test-support",
     "gpui_platform/screen-capture",
